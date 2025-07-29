@@ -11,6 +11,7 @@ Nov. 2021, doi: 10.1016/j.est.2021.103252.
 """
 
 import numpy as np
+import rainflow
 
 
 def kJ2kWh(kWh):
@@ -21,6 +22,27 @@ def kJ2kWh(kWh):
 def kWh2kJ(kJ):
     """Convert a value in kJ to kWh"""
     return kJ * 3600
+
+def years_to_usage_rate(years, dt):
+    """Convert a number of years to a usage rate
+    inputs:
+        years: life of the storage system in years
+        dt: time step of the simulation, in seconds
+     """
+    days = years * 365
+    hours = days * 24
+    seconds = hours * 3600
+    usage_lifetime = seconds / dt
+
+    return 1/usage_lifetime
+
+def cycles_to_usage_rate(cycles):
+    """Convert cycle number to degradation rate
+    inputs: 
+        cycles: number of cycles until the unit needs to be replaced
+        dt: time step of the simulation, in seconds
+    """
+    return 1/cycles
 
 
 class Battery:
@@ -57,6 +79,7 @@ class LIB:
             discharge_rate: discharge rate of the battery in MW
             max_SOC: upper boundary on battery SOC between 0 and 1
             min_SOC: lower boundary on battery SOC between 0 and 1
+            allow_grid_power_consumption: boolean flag for allowing grid to charge the battery
             initial_conditions: {SOC: iniital SOC between 0 and 1}
         """
 
@@ -72,6 +95,12 @@ class LIB:
         self.SOC = inititial_conditions["SOC"]  # [fraction]
         self.SOC_max = input_dict["max_SOC"]
         self.SOC_min = input_dict["min_SOC"]
+
+        # Flag for allowing grid to charge the battery
+        if "allow_grid_power_consumption" in input_dict.keys():
+            self.allow_grid_power_consumption = input_dict["allow_grid_power_consumption"]
+        else:
+            self.allow_grid_power_consumption = False
 
         self.T = 25  # [C] temperature
         self.SOH = 1  # State of Health
@@ -147,7 +176,7 @@ class LIB:
         )
 
         # initial state of battery outputs for hercules emulator
-        self.power_mw = 0
+        self.power_kw = 0
         self.P_reject = 0
         self.P_charge = 0
 
@@ -212,6 +241,7 @@ class LIB:
 
     def calc_power(self, I_bat):
         """Return battery power in kW"""
+        # NOTE: this might be in watts, ask Zack!
         return self.V_cell() * self.n_s * I_bat  # [kW]
 
     def step(self, inputs: dict):
@@ -221,14 +251,18 @@ class LIB:
         Inputs:
         - inputs: dictionary of inputs for the current time step which must have:
             - py_sims:{inputs:{battery_signal: ___ }} [kW] charging/discharging power desired
-            - py_sims:{inputs:{available_power: ___ }} [kW] power available for charging/discharging
+            - py_sims:{inputs:{locally_generated_power: ___ }} [kW] power available for
+                 charging/discharging that was generated onsite (not from grid)
 
         Outputs:
         - outptuts: see return_outputs() method
         """
 
         P_signal = inputs["py_sims"]["inputs"]["battery_signal"]  # [kW] requested power
-        P_avail = inputs["py_sims"]["inputs"]["available_power"]  # [kW] avaiable power
+        if self.allow_grid_power_consumption:
+            P_avail = np.inf
+        else:
+            P_avail = inputs["py_sims"]["inputs"]["locally_generated_power"]  # [kW] available power
 
         # Calculate charging/discharging current [A] from power
         I_charge, I_reject = self.control(P_signal, P_avail)
@@ -242,21 +276,18 @@ class LIB:
         self.step_cell(i_charge)
 
         # Calculate actual power
-        self.power_mw = self.calc_power(I_charge) * 1e-3
-        self.P_reject = P_signal - self.power_mw
+        self.power_kw = self.calc_power(I_charge) * 1e-3
+        self.P_reject = P_signal - self.power_kw
 
         # Update power signal error integral
         if (P_signal < self.max_charge_power) & (P_signal > self.max_discharge_power):
             self.error_sum += self.P_reject * self.dt
 
-        # assert (
-        #     self.power_mw >= P_avail
-        # ), "Battery is charging with more power than available."
-
         return self.return_outputs()
 
     def return_outputs(self):
-        return {"power": self.power_mw, "reject": self.P_reject, "soc": self.SOC}
+        return {"power": self.power_kw, "reject": self.P_reject, "soc": self.SOC,
+                "power_kW": -self.power_kw}
 
     def control(self, P_signal, P_avail):
         """
@@ -357,9 +388,7 @@ class SimpleBattery:
 
         # size = input_dict["size"]
         self.energy_capacity = input_dict["energy_capacity"] * 1e3  # [kWh]
-
         inititial_conditions = input_dict["initial_conditions"]
-
         self.SOC = inititial_conditions["SOC"]  # [fraction]
 
         self.SOC_max = input_dict["max_SOC"]
@@ -380,34 +409,109 @@ class SimpleBattery:
         self.R_min = -np.inf
         self.R_max = np.inf
 
+        # Flag for allowing grid to charge the battery
+        if "allow_grid_power_consumption" in input_dict.keys():
+            self.allow_grid_power_consumption = input_dict["allow_grid_power_consumption"]
+        else:
+            self.allow_grid_power_consumption = False
+
+        # Efficiency and self-discharge parameters
+        if "roundtrip_efficiency" in input_dict.keys():
+            self.eta_charge = np.sqrt(input_dict["roundtrip_efficiency"])
+            self.eta_discharge = np.sqrt(input_dict["roundtrip_efficiency"])
+        else:
+            self.eta_charge = 1
+            self.eta_discharge = 1
+
+        if "self_discharge_time_constant" in input_dict.keys():
+            self.tau_self_discharge = input_dict["self_discharge_time_constant"]
+        else:
+            self.tau_self_discharge = np.inf
+
+        if "track_usage" in input_dict.keys():
+            if input_dict["track_usage"]:
+                self.track_usage = True
+                # Set usage tracking parameters
+                if "usage_calc_interval" in input_dict.keys():
+                    self.usage_calc_interval = input_dict["usage_calc_interval"] / self.dt
+                else:
+                    self.usage_calc_interval = 100 / self.dt # timesteps
+                
+                if "usage_lifetime" in input_dict.keys():
+                    usage_lifetime = input_dict["usage_lifetime"]
+                    self.usage_time_rate = years_to_usage_rate(usage_lifetime, self.dt)
+                else:
+                    self.usage_time_rate = 0 
+                if "usage_cycles" in input_dict.keys():
+                    usage_cycles = input_dict["usage_cycles"]
+                    self.usage_cycles_rate = cycles_to_usage_rate(usage_cycles)
+                else:
+                    self.usage_cycles_rate = 0 
+
+                # TODO: add the ability to impact efficiency of the battery operation
+
+            else:
+                self.track_usage = False
+                self.usage_calc_interval = np.inf
+        else:
+            self.track_usage = False
+            self.usage_calc_interval = np.inf        
+
+        # Degradation and state storage
+        self.P_charge_storage = []
+        self.E_store = []
+        self.total_cycle_usage = 0
+        self.cycle_usage_perc = 0
+        self.total_time_usage = 0
+        self.time_usage_perc = 0
+        self.step_counter = 0
+        # TODO there should be a better way to dynamically store these than to append a list
+
+        self.build_SS()
+        self.x = np.array([[inititial_conditions["SOC"] * self.energy_capacity * 3600]])
+        self.y = None
+
         # self.total_battery_capacity = 3600 * self.energy_capacity / self.dt
         self.current_batt_state = self.SOC * self.energy_capacity
         self.E = kWh2kJ(self.current_batt_state)
 
-        self.power_mw = 0
+        self.power_kw = 0
         self.P_reject = 0
         self.P_charge = 0
 
         self.needed_inputs = {"battery_signal": 0.0}
 
-    def return_outputs(self):
-        return {"power": self.power_mw, "reject": self.P_reject, "soc": self.SOC}
-
     def step(self, inputs):
+
+        self.step_counter += 1
+
         # power available for the battery to use for charging (should be >=0)
         P_signal = inputs["py_sims"]["inputs"]["battery_signal"]
         # power signal desired by the controller
-        P_avail = inputs["py_sims"]["inputs"]["available_power"]
+        if self.allow_grid_power_consumption:
+            P_avail = np.inf
+        else:
+            P_avail = inputs["py_sims"]["inputs"]["locally_generated_power"]  # [kW] available power
 
-        self.control(P_avail, P_signal)
+        P_charge, P_reject = self.control(P_avail, P_signal)
 
         # Update energy state
-        self.E += self.P_charge * self.dt
+        # self.E += self.P_charge * self.dt
+        self.step_SS(P_charge)
+        self.E = self.x[0, 0]  # TODO find a better way to make self.x 1-D
 
         self.current_batt_state = kJ2kWh(self.E)
 
-        self.power_mw = self.P_charge
+        self.power_kw = P_charge
         self.SOC = self.current_batt_state / self.energy_capacity
+
+        self.P_charge_storage.append(P_charge)
+        self.E_store.append(self.E)
+
+        if self.step_counter >= self.usage_calc_interval:
+            # reset step_counter
+            self.step_counter = 0
+            self.calc_usage()
 
         return self.return_outputs()
 
@@ -427,31 +531,110 @@ class SimpleBattery:
                     constraints (negative)
         """
 
+        # TODO remove ramp rate constraints because they are never used?
+
         # Upper constraints [kW]
-        c_hi1 = (self.E_max - self.E) / self.dt  # energy
+        # c_hi1 = (self.E_max - self.E) / self.dt  # energy
+        c_hi1 = self.SS_input_function_inverse((self.E_max - self.x[0, 0]) / self.dt)
         c_hi2 = self.P_max  # power
         c_hi3 = self.R_max * self.dt + self.P_charge  # ramp rate
+        c_hi4 = P_avail
 
         # Lower constraints [kW]
-        c_lo1 = (self.E_min - self.E) / self.dt  # energy
+        # c_lo1 = (self.E_min - self.E) / self.dt  # energy
+        c_lo1 = self.SS_input_function_inverse((self.E_min - self.x[0, 0]) / self.dt)
         c_lo2 = self.P_min  # power
         c_lo3 = self.R_min * self.dt + self.P_charge  # ramp rate
 
         # High constraint is the most restrictive of the high constraints
-        c_hi = np.min([c_hi1, c_hi2, c_hi3, P_avail])
+        c_hi = np.min([c_hi1, c_hi2, c_hi3, c_hi4])
+        c_hi = np.max([c_hi, 0])
 
         # Low constraint is the most restrictive of the low constraints
         c_lo = np.max([c_lo1, c_lo2, c_lo3])
+        c_lo = np.min([c_lo, 0])
+
         # TODO: force low constraint to be no higher than lowest high constraint
-
         if (P_signal >= c_lo) & (P_signal <= c_hi):
-            self.P_charge = P_signal
-            self.P_reject = 0
+            P_charge = P_signal
+            P_reject = 0
         elif P_signal < c_lo:
-            self.P_charge = c_lo
-            self.P_reject = P_signal - self.P_charge
+            P_charge = c_lo
+            P_reject = P_signal - P_charge
         elif P_signal > c_hi:
-            self.P_charge = c_hi
-            self.P_reject = P_signal - self.P_charge
+            P_charge = c_hi
+            P_reject = P_signal - P_charge
 
-    []
+        self.P_charge = P_charge
+        self.P_reject = P_reject
+
+        return P_charge, P_reject
+
+    def build_SS(self):
+        self.A = np.array([[-1 / self.tau_self_discharge]])
+        # B is the function in
+        self.C = np.array([[1, 0]]).T
+        self.D = np.array([[0, 1]]).T
+
+    def SS_input_function(self, P_charge):
+
+        # P_in is the amount of power that actually gets stored in the state E
+        # P_charge is the amount of power given to the charging physics
+
+        if P_charge >= 0:
+            P_in = self.eta_charge * P_charge
+        else:
+            P_in = P_charge / self.eta_discharge
+        return P_in
+
+    def SS_input_function_inverse(self, P_in):
+        if P_in >= 0:
+            P_charge = P_in / self.eta_charge
+        else:
+            P_charge = P_in * self.eta_discharge
+        return P_charge
+
+    def step_SS(self, u):
+        # Advance the state-space loop
+        xd = self.A * self.x + self.SS_input_function(u)
+        y = self.C * self.x + self.D * u
+
+        self.x = self.integrate(self.x, xd)
+        self.y = y
+
+    def integrate(self, x, xd):
+        # better integration -> use the closed form step response solution?
+        return x + xd * self.dt  # Euler integration
+
+    def calc_usage(self):
+
+        # Count rainflow cycles
+        # This step uses sthe rainflow algorithm to count how many cycles exist in the
+        #   storage operation using the three-point technique (ASTM Standard E 1049-85)
+        #   The algorithm returns the size (amplitude) of the cycle, and the number of cycles at 
+        #       that amplitude at that point in the signal
+        ranges_counts = rainflow.count_cycles(self.E_store)
+        ranges = np.array([rc[0] for rc in ranges_counts])
+        counts = np.array([rc[1] for rc in ranges_counts])
+        self.total_cycle_usage = (ranges * counts).sum() / self.E_max
+        self.cycle_usage_perc = self.total_cycle_usage * self.usage_cycles_rate * 100
+
+        # Calculate time usage
+        self.total_time_usage += self.usage_calc_interval * self.dt
+        self.time_usage_perc = self.total_time_usage * self.usage_time_rate * 100
+
+        # self.apply_degradation(this_period_degradation)
+
+    def apply_degradation(self, degradation):
+        # total_degradation_effect = self.total_degradation*self.degradation_rate
+        # print('degradation penalty', total_degradation_effect, np.sqrt(total_degradation_effect))
+        # self.eta_charge = self.eta_charge - np.sqrt(total_degradation_effect)
+        # self.eta_discharge = self.eta_discharge - np.sqrt(total_degradation_effect)
+        raise NotImplementedError(
+            "Degradation impacts on real-time efficiency have not yet been implemented."
+        )
+
+    def return_outputs(self):
+        return {"power": self.power_kw, "reject": self.P_reject, "soc": self.SOC,
+                "usage_in_time": self.time_usage_perc, "usage_in_cycles": self.cycle_usage_perc,
+                "total_cycles":self.total_cycle_usage, "power_kW": -self.power_kw}
